@@ -1,0 +1,108 @@
+// src/parsers/rukoZipLoader.ts
+import JSZip from 'jszip';
+import { parseRukoLog } from './rukoLogParser';
+import { DroneTelemetryPoint, FlightSummary } from '../types/droneTelemetry';
+
+export async function processRukoFlightFile(
+  file: File
+): Promise<{ points: DroneTelemetryPoint[]; summary: FlightSummary }> {
+  // If the user drops a .zip containing .txt and .logbin
+  if (file.name.endsWith('.zip')) {
+    const zip = new JSZip();
+    const contents = await zip.loadAsync(file);
+
+    // Look for the main .txt or .csv flight record
+    const txtFile = Object.values(contents.files).find(
+      (f) => !f.dir && (f.name.endsWith('.txt') || f.name.endsWith('.csv'))
+    );
+
+    if (txtFile) {
+      const textContent = await txtFile.async('text');
+      return parseRukoLog(textContent, txtFile.name);
+    }
+
+    // Fallback: search for .logbin file
+    const logbinFile = Object.values(contents.files).find(
+      (f) => !f.dir && f.name.endsWith('.logbin')
+    );
+
+    if (logbinFile) {
+      const arrayBuffer = await logbinFile.async('arraybuffer');
+      return parseRukoLogBin(new Uint8Array(arrayBuffer), logbinFile.name);
+    }
+
+    throw new Error('No readable flight log (.txt or .logbin) found in the zip.');
+  }
+
+  // If the user drops a single .txt or .csv directly
+  const textContent = await file.text();
+  return parseRukoLog(textContent, file.name);
+}
+
+/**
+ * Parses binary telemetry frames from Ruko .logbin records
+ */
+export function parseRukoLogBin(
+  buffer: Uint8Array,
+  fileName: string
+): { points: DroneTelemetryPoint[]; summary: FlightSummary } {
+  const points: DroneTelemetryPoint[] = [];
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+
+  // Ruko/C-Fly telemetry frames usually have header markers (e.g., 0x55 0xAA or fixed-length packet frames)
+  let offset = 0;
+  let index = 0;
+
+  while (offset + 32 <= buffer.byteLength) {
+    try {
+      // Extract position & dynamics
+      // (Adjust offsets based on specific firmware packet structure)
+      const lat = view.getInt32(offset + 4, true) / 1e7;
+      const lon = view.getInt32(offset + 8, true) / 1e7;
+      const altAGL = view.getInt16(offset + 12, true) / 10.0; // Altitude in meters
+      const pitch = view.getInt16(offset + 14, true) / 10.0;  // Degrees
+      const roll = view.getInt16(offset + 16, true) / 10.0;   // Degrees
+      const yaw = ((view.getInt16(offset + 18, true) / 10.0) + 360) % 360; // Degrees
+      const hSpeed = view.getUint16(offset + 20, true) / 10.0;
+      const vSpeed = view.getInt16(offset + 22, true) / 10.0;
+      const battery = view.getUint8(offset + 24);
+
+      if (lat !== 0 && lon !== 0 && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+        const minutes = Math.floor(index / 60);
+        const seconds = index % 60;
+        points.push({
+          timestamp: index * 1000,
+          timeString: `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`,
+          latitude: lat,
+          longitude: lon,
+          altitudeAGL: Math.max(0, parseFloat(altAGL.toFixed(1))),
+          pitch: parseFloat(pitch.toFixed(1)),
+          roll: parseFloat(roll.toFixed(1)),
+          yaw: parseFloat(yaw.toFixed(1)),
+          speedHorizontal: parseFloat(hSpeed.toFixed(1)),
+          speedVertical: parseFloat(vSpeed.toFixed(1)),
+          batteryPercent: Math.min(100, battery),
+          batteryVoltage: 7.4,
+          satellites: 16,
+          distanceFromHome: 0,
+        });
+        index++;
+      }
+      offset += 32; // Jump to next frame
+    } catch {
+      break;
+    }
+  }
+
+  const summary: FlightSummary = {
+    fileName,
+    totalDurationSeconds: points.length,
+    maxAltitude: Math.max(...points.map((p) => p.altitudeAGL), 0),
+    maxDistance: Math.max(...points.map((p) => p.distanceFromHome), 0),
+    maxSpeed: Math.max(...points.map((p) => p.speedHorizontal), 0),
+    startLat: points[0]?.latitude || 0,
+    startLon: points[0]?.longitude || 0,
+  };
+
+  return { points, summary };
+}
